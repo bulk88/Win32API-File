@@ -1,5 +1,5 @@
 /* Win32API/File.xs */
-
+#define PERL_NO_GET_CONTEXT
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
@@ -57,6 +57,7 @@
     static void
     ErrPrintf( const char *sFmt, ... )
     {
+      dTHX;
       va_list pAList;
       static char *sEnv= NULL;
       DWORD uErr= GetLastError();
@@ -83,6 +84,187 @@ SaveErr( BOOL bFailed )
 {
     if(  bFailed  ) {
 	uLastFileErr= GetLastError();
+    }
+}
+/*do not turn null_arg into a function, compiler optimizes sv_flags
+and sv_u SV head member dereferncing of null_arg and SvIPNUV together
+
+each of these helpers was designed so that in the ideal case, no function
+calls are made from the helper
+*/
+static BOOL BoolIn(pTHX_ SV * isvb){
+    return null_arg(isvb)||!SvTRUE(isvb)
+    ? (BOOL)0 :
+        looks_like_number(isvb) ?
+            (BOOL)SvIV(isvb) :
+            (BOOL)1;    
+}
+static PVOID BufIn(pTHX_ SV * isvs){
+    if(  null_arg(isvs)  )
+	    return NULL;
+	else
+	    return (PVOID) SvPV_nolen( isvs );
+}
+static U_IVUV IntIn(pTHX_ SV * isvn, CBOOL bUV){
+    U_IVUV ret;
+    null_arg(isvn) ?
+        ( bUV ?
+            (ret.uv  = (UV)0)
+            :(ret.iv  = (IV)0)
+        ):( bUV ?
+            (ret.uv = INT2PTR(UV,SvUV(isvn)))
+            :(ret.iv = INT2PTR(IV,SvIV(isvn))));
+    return ret;
+}
+static U_IVUV optNumIn(pTHX_ SV * isvn, CBOOL bUV){
+    U_IVUV ret;
+    if( null_arg(isvn) || !SvOK(isvn)){
+        if(bUV)
+            ret.uv  = (UV)0;
+        else
+            ret.iv  = (IV)0;
+    }
+    else{
+        if(bUV)
+            ret.uv = SvUV(isvn);
+        else
+            ret.iv = SvIV(isvn);
+    }
+    return ret;
+}
+/*an attempt to figure out what these macros do */
+/*static DWORD fn_null_arg(pTHX_ SV * sv){
+    return null_arg(sv);
+}
+static DWORD fn_autosize(pTHX_ SV * sv){
+    return autosize(sv);
+}
+static DWORD fn_optUV(pTHX_ SV * sv){
+    return optUV(sv);
+}
+static DWORD fn_init_buf_l(pTHX_ SV * svSize){
+	return (  fn_null_arg(aTHX_ svSize) ? 0 : fn_autosize(aTHX_ svSize) ? fn_optUV(aTHX_ svSize)
+	   : strtoul( 1+SvPV_nolen(svSize), NULL, 10 )  );
+}
+*/
+/* Initialize a buffer size argument of type DWORD: */
+static DWORD fn_init_buf_l(pTHX_ SV * svSize){
+/*null_arg is the call($var1, [], $var2) array ref null thing */
+    if(null_arg(svSize))
+        return 0;
+    else{
+        char * s; /* expanded autosize macro with cached PV and ! removed*/
+        if(  SvOK(svSize)  &&  ! SvROK(svSize)
+			&&  (s = SvPV_nolen(svSize))
+            &&  '=' == *s  ){
+            return strtoul( 1+s, NULL, 10 );   
+        }
+        else{
+            /* expanded optUV with cached null_arg and removed null_arg branch*/
+            return !SvOK(svSize) ? 0 : (DWORD)SvUV(svSize);
+        }
+    }
+
+}
+/*original macro
+#define init_buf_l( svSize )						\
+	(  null_arg(svSize) ? 0 : autosize(svSize) ? optUV(svSize)	\
+	   : strtoul( 1+SvPV_nolen(svSize), NULL, 10 )  )
+*/
+/* In INPUT section put "= init_buf_l($arg);" after variable name. */
+
+static char * fn_grow_buf_l(pTHX_ SV * svBuf, STRLEN * lSize, SV * svSize, CBOOL isWide ){
+    char * sBuf;
+	if(  null_arg(svBuf)  ) {
+	    sBuf= NULL;
+	} else {
+        if(((SvFLAGS(svBuf) & SVf_OK) & ~ SVf_POK) ||SvTYPE(svBuf) < SVt_PV)
+            sv_setpvn(svBuf,"",0);
+        SvCUR(svBuf) = 0;
+        /*combination of lwSvGROW and lSvGROW*/
+        {   const STRLEN bufLen = (isWide ? sizeof(WCHAR) : 1)*( 0==(*lSize) ? MIN_GROW_SIZE : (*lSize)+1 );
+            sBuf = SvGROW(svBuf, bufLen);
+        }
+        *(wchar_t *)sBuf = L'\0'; /*technical overflow here*/
+        {
+            char * s;
+            //expanded autosize macro
+            if(!(SvOK(svSize)  &&  ! SvROK(svSize)
+                &&  ((s = SvPV_nolen(svSize)), ('=' == *s))))
+                  *lSize=(isWide ? SvLEN(svBuf) /sizeof(WCHAR): SvLEN(svBuf)) - 1;
+        }
+	}
+    return sBuf;
+}
+
+/*flags for NumBufIn*/
+#define NUMBUFIN_UV 0
+#define NUMBUFIN_IV 1
+#define NUMBUFIN_OPT 0 /*dont warn on undef*/
+#define NUMBUFIN_REQ 2 /*warn on undef*/
+
+static U_IVUV * NumBufIn(pTHX_ SV * sv, U_IVUV * pn, UCHAR flags){
+    U_IVUV * ret;
+	if(  null_arg(sv)  )
+	    ret = NULL;
+    else{
+        ret = pn;
+        if(flags & NUMBUFIN_REQ){
+            getnum:
+            if(flags & NUMBUFIN_IV) ret->iv = SvIV(sv);
+            else                    ret->uv = SvUV(sv);
+        }
+        else{ /*optional branch, dont warn on undef*/
+            if(SvOK(sv)) goto getnum;
+            else{
+                if(flags & NUMBUFIN_IV) ret->iv  = (IV)0;
+                else                    ret->uv  = (UV)0;
+            }
+        }
+    }
+    return ret;
+}
+
+static void BoolOut(pTHX_ SV * arg, BOOL var){
+	if(  ! null_arg(arg)  &&  ! SvREADONLY(arg)  ) {
+	    if(  var  ) {
+		sv_setiv( arg, (IV)var );
+	    } else {
+		sv_setsv( arg, &PL_sv_no );
+	    }
+	}
+}
+
+/*flags for NumOut*/
+#define NUMOUT_UV 0
+#define NUMOUT_IV 1
+#define NUMOUT_OUT 0 /*fatally error in sv_set*v if SvREADONLY*/
+#define NUMOUT_IN 2 /*do not set the SV if it is SvREADONLY (numeric constant in Perl Lang)*/
+#define NUMOUT_LIT 0 /*UPU_IVUV use member "num " for U_IVUV  */
+#define NUMOUT_PTR 4 /*UPU_IVUV member "p" should be dereferenced to get U_IVUV*/
+#define NUMOUT_NOMAGIC 0 /*do not do SvSETMAGIC on SV * */
+#define NUMOUT_MAGIC 8 /*do SvSETMAGIC on SV * */
+/*next 2 size flags are meaningless if not NUMOUT_PTR*/
+#define NUMOUT_4BYTES 0 /*p is a pointer to 32 bit number, I/UV flag important too*/
+#define NUMOUT_8BYTES 16 /*p is a pointer to 64 bit number, I/UV flag important too
+                          , will truncate on 32 bit IV perl*/
+static void NumOut(pTHX_ SV * arg, UPU_IVUV var, UCHAR flags){
+    if(  ! null_arg(arg)  &&  ((flags & NUMOUT_IN) ? ! SvREADONLY(arg) : 1)  ){
+        if(flags & NUMOUT_PTR)
+	{
+	  if(flags & NUMOUT_8BYTES){
+	    if(flags & NUMOUT_IV) var.num.iv = (IV) *(var.p.i64);
+	    else var.num.uv = (UV) *(var.p.u64);
+	  } else {
+	    if(flags & NUMOUT_IV) var.num.iv = (IV) *(var.p.i32);
+	    else var.num.uv = (UV) *(var.p.u32);
+	  }
+	}
+        if(flags & NUMOUT_IV)
+            sv_setiv(arg, var.num.iv);
+        else
+            sv_setuv(arg, var.num.uv);
+        if(flags & NUMOUT_MAGIC) SvSETMAGIC(arg);
     }
 }
 
@@ -137,7 +319,7 @@ CopyFileW( swOldFileName, swNewFileName, bFailIfExists )
 	RETVAL
 
 
-HANDLE
+void
 CreateFileA( sPath, uAccess, uShare, pSecAttr, uCreate, uFlags, hModel )
 	char *	sPath
 	DWORD	uAccess
@@ -146,20 +328,27 @@ CreateFileA( sPath, uAccess, uShare, pSecAttr, uCreate, uFlags, hModel )
 	DWORD	uCreate
 	DWORD	uFlags
 	HANDLE	hModel
-    CODE:
-	RETVAL= CreateFileA( sPath, uAccess, uShare,
+    PREINIT:
+    HANDLE hreturn;
+    SV *  svreturn;
+    PPCODE:
+	hreturn= CreateFileA( sPath, uAccess, uShare,
 	  pSecAttr, uCreate, uFlags, hModel );
-	if(  INVALID_HANDLE_VALUE == RETVAL  ) {
+	if(  INVALID_HANDLE_VALUE == hreturn  ) {
 	    SaveErr( 1 );
-	    XSRETURN_NO;
-	} else if(  0 == RETVAL  ) {
-	    XSRETURN_PV( "0 but true" );
+        svreturn = &PL_sv_no;
 	} else {
-	    XSRETURN_UV( PTR2UV(RETVAL) );
+        if(  0 == hreturn  ) {
+            svreturn = newSVpvs("0 but true" );
+        } else {
+            svreturn = newSVuv(PTR2UV(hreturn));
+        }
+        sv_2mortal(svreturn);
 	}
+    PUSHs(svreturn);
 
 
-HANDLE
+void
 CreateFileW( swPath, uAccess, uShare, pSecAttr, uCreate, uFlags, hModel )
 	WCHAR *	swPath
 	DWORD	uAccess
@@ -168,17 +357,24 @@ CreateFileW( swPath, uAccess, uShare, pSecAttr, uCreate, uFlags, hModel )
 	DWORD	uCreate
 	DWORD	uFlags
 	HANDLE	hModel
-    CODE:
-	RETVAL= CreateFileW( swPath, uAccess, uShare,
+    PREINIT:
+    HANDLE hreturn;
+    SV *  svreturn;
+    PPCODE:
+	hreturn= CreateFileW( swPath, uAccess, uShare,
 	  pSecAttr, uCreate, uFlags, hModel );
-	if(  INVALID_HANDLE_VALUE == RETVAL  ) {
+	if(  INVALID_HANDLE_VALUE == hreturn  ) {
 	    SaveErr( 1 );
-	    XSRETURN_NO;
-	} else if(  0 == RETVAL  ) {
-	    XSRETURN_PV( "0 but true" );
+        svreturn = &PL_sv_no;
 	} else {
-	    XSRETURN_UV( PTR2UV(RETVAL) );
+        if(  0 == hreturn  ) {
+            svreturn = newSVpvs("0 but true" );
+        } else {
+            svreturn = newSVuv(PTR2UV(hreturn));
+        }
+        sv_2mortal(svreturn);
 	}
+    PUSHs(svreturn);
 
 
 BOOL
@@ -224,7 +420,7 @@ DeleteFileW( swFileName )
     OUTPUT:
 	RETVAL
 
-
+# todo
 BOOL
 DeviceIoControl( hDevice, uIoControlCode, pInBuf, lInBuf, opOutBuf, lOutBuf, olRetBytes, pOverlapped )
 	HANDLE	hDevice
@@ -337,20 +533,24 @@ GetLogicalDrives()
 
 DWORD
 GetLogicalDriveStringsA( lBufSize, osBuffer )
-	DWORD	lBufSize	= init_buf_l($arg);
+    PREINIT:
+    SV * svosBuffer = ST(1);/*flipped for locality*/
+    SV * svlBufSize = ST(0);
+    INPUT:
+	DWORD	lBufSize	= init_buf_l(svlBufSize);
 	char *	osBuffer	= NO_INIT
     CODE:
-	grow_buf_l( osBuffer,ST(1),char *, lBufSize,ST(0) );
+	grow_buf_l( osBuffer,svosBuffer,char *, lBufSize,svlBufSize );
 	RETVAL= GetLogicalDriveStringsA( lBufSize, osBuffer );
-	if(  lBufSize < RETVAL  &&  autosize(ST(0))  ) {
+	if(  lBufSize < RETVAL  &&  autosize(svlBufSize)  ) {
 	    lBufSize= RETVAL;
-	    grow_buf_l( osBuffer,ST(1),char *, lBufSize,ST(0) );
+	    grow_buf_l( osBuffer,svosBuffer,char *, lBufSize,svlBufSize );
 	    RETVAL= GetLogicalDriveStringsA( lBufSize, osBuffer );
 	}
 	if(  0 == RETVAL  ||  lBufSize < RETVAL  ) {
 	    SaveErr( 1 );
 	} else {
-	    trunc_buf_l( 1, osBuffer,ST(1), RETVAL );
+	    trunc_buf_l( 1, osBuffer,svosBuffer, RETVAL );
 	}
     OUTPUT:
 	RETVAL
@@ -359,20 +559,24 @@ GetLogicalDriveStringsA( lBufSize, osBuffer )
 
 DWORD
 GetLogicalDriveStringsW( lwBufSize, oswBuffer )
-	DWORD	lwBufSize	= init_buf_lw($arg);
+    PREINIT:
+    SV * svoswBuffer = ST(1);/*flipped for locality*/
+    SV * svlwBufSize = ST(0);
+    INPUT:
+	DWORD	lwBufSize	= init_buf_lw(svlwBufSize);
 	WCHAR *	oswBuffer	= NO_INIT
     CODE:
-	grow_buf_lw( oswBuffer,ST(1), lwBufSize,ST(0) );
+	grow_buf_lw( oswBuffer,svoswBuffer, lwBufSize,svlwBufSize );
 	RETVAL= GetLogicalDriveStringsW( lwBufSize, oswBuffer );
-	if(  lwBufSize < RETVAL  &&  autosize(ST(0))  ) {
+	if(  lwBufSize < RETVAL  &&  autosize(svlwBufSize)  ) {
 	    lwBufSize= RETVAL;
-	    grow_buf_lw( oswBuffer,ST(1), lwBufSize,ST(0) );
+	    grow_buf_lw( oswBuffer,svoswBuffer, lwBufSize,svlwBufSize );
 	    RETVAL= GetLogicalDriveStringsW( lwBufSize, oswBuffer );
 	}
 	if(  0 == RETVAL  ||  lwBufSize < RETVAL  ) {
 	    SaveErr( 1 );
 	} else {
-	    trunc_buf_lw( 1, oswBuffer,ST(1), RETVAL );
+	    trunc_buf_lw( 1, oswBuffer,svoswBuffer, RETVAL );
 	}
     OUTPUT:
 	RETVAL
@@ -381,52 +585,70 @@ GetLogicalDriveStringsW( lwBufSize, oswBuffer )
 
 BOOL
 GetVolumeInformationA( sRootPath, osVolName, lVolName, ouSerialNum, ouMaxNameLen, ouFsFlags, osFsType, lFsType )
+    PREINIT:
+    SV * svosVolName;
+    SV * svlVolName = ST(2);
+    SV * svosFsType;
+    SV * svlFsType;
+    INPUT:   
 	char *	sRootPath
 	char *	osVolName	= NO_INIT
-	DWORD	lVolName	= init_buf_l($arg);
-	oDWORD	&ouSerialNum	= optUV($arg);
-	oDWORD	&ouMaxNameLen	= optUV($arg);
-	oDWORD	&ouFsFlags	= optUV($arg);
+	DWORD	lVolName	= init_buf_l(svlVolName);
+	oDWORD	ouSerialNum	
+	oDWORD	ouMaxNameLen
+	oDWORD	ouFsFlags
 	char *	osFsType	= NO_INIT
-	DWORD	lFsType		= init_buf_l($arg);
+	DWORD	lFsType		= init_buf_l( svlFsType  = $arg);
     CODE:
-	grow_buf_l( osVolName,ST(1),char *, lVolName,ST(2) );
-	grow_buf_l( osFsType,ST(6),char *, lFsType,ST(7) );
+    svosVolName = ST(1);
+	grow_buf_l( osVolName,svosVolName,char *, lVolName,svlVolName );
+    svosFsType = ST(6);
+	grow_buf_l( osFsType,svosFsType,char *, lFsType,svlFsType );
 	RETVAL= GetVolumeInformationA( sRootPath, osVolName, lVolName,
 		  &ouSerialNum, &ouMaxNameLen, &ouFsFlags, osFsType, lFsType );
 	SaveErr( !RETVAL );
     OUTPUT:
 	RETVAL
-	osVolName	trunc_buf_z( RETVAL, osVolName,ST(1) );
-	osFsType	trunc_buf_z( RETVAL, osFsType,ST(6) );
-	ouSerialNum
-	ouMaxNameLen
-	ouFsFlags
+	osVolName	trunc_buf_z( RETVAL, osVolName,svosVolName );
+	osFsType	trunc_buf_z( RETVAL, osFsType,svosFsType );
+    SETMAGIC: DISABLE
+	ouSerialNum ODWORDOUTMG(ouSerialNum);
+	ouMaxNameLen ODWORDOUTMG(ouMaxNameLen);
+	ouFsFlags ODWORDOUTMG(ouFsFlags);
 
 
 BOOL
 GetVolumeInformationW( swRootPath, oswVolName, lwVolName, ouSerialNum, ouMaxNameLen, ouFsFlags, oswFsType, lwFsType )
+    PREINIT:
+    SV * svoswVolName;
+    SV * svlwVolName = ST(2);
+    SV * svoswFsType;
+    SV * svlwFsType;
+    INPUT:
 	WCHAR *	swRootPath
 	WCHAR *	oswVolName	= NO_INIT
-	DWORD	lwVolName	= init_buf_lw($arg);
-	oDWORD	&ouSerialNum	= optUV($arg);
-	oDWORD	&ouMaxNameLen	= optUV($arg);
-	oDWORD	&ouFsFlags	= optUV($arg);
+	DWORD	lwVolName	= init_buf_lw(svlwVolName);
+	oDWORD	ouSerialNum	
+	oDWORD	ouMaxNameLen
+	oDWORD	ouFsFlags
 	WCHAR *	oswFsType	= NO_INIT
-	DWORD	lwFsType	= init_buf_lw($arg);
+	DWORD	lwFsType	= init_buf_lw( svlwFsType = $arg);
     CODE:
-	grow_buf_lw( oswVolName,ST(1), lwVolName,ST(2) );
-	grow_buf_lw( oswFsType,ST(6), lwFsType,ST(7) );
+    svoswVolName = ST(1);
+	grow_buf_lw( oswVolName,svoswVolName, lwVolName,svlwVolName );
+    svoswFsType = ST(6);
+	grow_buf_lw( oswFsType,svoswFsType, lwFsType,svlwFsType );
 	RETVAL= GetVolumeInformationW( swRootPath, oswVolName, lwVolName,
 	  &ouSerialNum, &ouMaxNameLen, &ouFsFlags, oswFsType, lwFsType );
 	SaveErr( !RETVAL );
     OUTPUT:
 	RETVAL
-	oswVolName	trunc_buf_zw( RETVAL, oswVolName,ST(1) );
-	oswFsType	trunc_buf_zw( RETVAL, oswFsType,ST(6) );
-	ouSerialNum
-	ouMaxNameLen
-	ouFsFlags
+	oswVolName	trunc_buf_zw( RETVAL, oswVolName,svoswVolName );
+	oswFsType	trunc_buf_zw( RETVAL, oswFsType,svoswFsType );
+    SETMAGIC: DISABLE
+	ouSerialNum   ODWORDOUTMG(ouSerialNum)
+	ouMaxNameLen ODWORDOUTMG(ouMaxNameLen);
+	ouFsFlags ODWORDOUTMG(ouMaxNameLen);
 
 
 BOOL
@@ -495,70 +717,91 @@ MoveFileExW( swOldName, swNewName, uFlags )
 	RETVAL
 
 
-long
+SV *
 OsFHandleOpenFd( hOsFHandle, uMode )
 	long	hOsFHandle
 	DWORD	uMode
+    PREINIT:
+    long    nrtn;
     CODE:
-	RETVAL= win32_open_osfhandle( hOsFHandle, uMode );
-	if(  RETVAL < 0  ) {
+	nrtn= win32_open_osfhandle( hOsFHandle, uMode );
+	if(  nrtn < 0  ) {
 	    SaveErr( 1 );
-	    XSRETURN_NO;
-	} else if(  0 == RETVAL  ) {
-	    XSRETURN_PV( "0 but true" );
+        RETVAL = &PL_sv_no;
 	} else {
-	    XSRETURN_IV( (IV) RETVAL );
+        if(  0 == nrtn  ) {
+            RETVAL = newSVpvs("0 but true" );
+        } else {
+            RETVAL = newSViv(PTR2IV(nrtn));
+        }
 	}
-
+    OUTPUT:
+    RETVAL
 
 DWORD
 QueryDosDeviceA( sDeviceName, osTargetPath, lTargetBuf )
+    PREINIT:
+    SV * svosTargetPath;
+    SV * svlTargetBuf;
+    INPUT:
 	char *	sDeviceName
 	char *	osTargetPath	= NO_INIT
-	DWORD	lTargetBuf	= init_buf_l($arg);
+	DWORD	lTargetBuf	= init_buf_l(svlTargetBuf = $arg);
     CODE:
-	grow_buf_l( osTargetPath,ST(1),char *, lTargetBuf,ST(2) );
+    svosTargetPath = ST(1);
+	grow_buf_l( osTargetPath,svosTargetPath,char *, lTargetBuf,svlTargetBuf );
 	RETVAL= QueryDosDeviceA( sDeviceName, osTargetPath, lTargetBuf );
 	SaveErr( 0 == RETVAL );
     OUTPUT:
 	RETVAL
-	osTargetPath	trunc_buf_l( 1, osTargetPath,ST(1), RETVAL );
+	osTargetPath	trunc_buf_l( 1, osTargetPath,svosTargetPath, RETVAL );
 
 
 DWORD
 QueryDosDeviceW( swDeviceName, oswTargetPath, lwTargetBuf )
+    PREINIT:
+    SV * svoswTargetPath;
+    SV * svlwTargetBuf;
+    INPUT:
 	WCHAR *	swDeviceName
 	WCHAR *	oswTargetPath	= NO_INIT
-	DWORD	lwTargetBuf	= init_buf_lw($arg);
+	DWORD	lwTargetBuf	= init_buf_lw( svlwTargetBuf = $arg);
     CODE:
-	grow_buf_lw( oswTargetPath,ST(1), lwTargetBuf,ST(2) );
+    svoswTargetPath = ST(1);
+	grow_buf_lw( oswTargetPath,svoswTargetPath, lwTargetBuf,svlwTargetBuf );
 	RETVAL= QueryDosDeviceW( swDeviceName, oswTargetPath, lwTargetBuf );
 	SaveErr( 0 == RETVAL );
     OUTPUT:
 	RETVAL
-	oswTargetPath	trunc_buf_lw( 1, oswTargetPath,ST(1), RETVAL );
+	oswTargetPath	trunc_buf_lw( 1, oswTargetPath,svoswTargetPath, RETVAL );
 
 
 BOOL
 ReadFile( hFile, opBuffer, lBytes, olBytesRead, pOverlapped )
+    PREINIT:
+    SV * svopBuffer;
+    SV * svlBytes;
+    INPUT:
 	HANDLE	hFile
 	BYTE *	opBuffer	= NO_INIT
-	DWORD	lBytes		= init_buf_l($arg);
+	DWORD	lBytes		= init_buf_l(svlBytes = $arg);
 	oDWORD	&olBytesRead
 	void *	pOverlapped
     CODE:
-	grow_buf_l( opBuffer,ST(1),BYTE *, lBytes,ST(2) );
+    svopBuffer = ST(1);
+	grow_buf_l( opBuffer,svopBuffer,BYTE *, lBytes,svlBytes );
 	/* Don't read more bytes than asked for if buffer is already big: */
-	lBytes= init_buf_l(ST(2));
-	if(  0 == lBytes  &&  autosize(ST(2))  ) {
-	    lBytes= SvLEN( ST(1) ) - 1;
+	lBytes= init_buf_l(svlBytes);
+	if(  0 == lBytes  &&  autosize(svlBytes)  ) {
+	    lBytes= SvLEN( svopBuffer ) - 1;
 	}
 	RETVAL= ReadFile( hFile, opBuffer, lBytes, &olBytesRead, pOverlapped );
 	SaveErr( !RETVAL );
     OUTPUT:
 	RETVAL
-	opBuffer	trunc_buf_l( RETVAL, opBuffer,ST(1), olBytesRead );
-	olBytesRead
+	opBuffer	trunc_buf_l( RETVAL, opBuffer,svopBuffer, olBytesRead );
+    SETMAGIC: DISABLE
+	olBytesRead ODWORDOUTMG(olBytesRead)
 
 
 BOOL
@@ -592,23 +835,28 @@ SetErrorMode( uNewMode )
 	UINT	uNewMode
 
 
-LONG
+SV *
 SetFilePointer( hFile, ivOffset, ioivOffsetHigh, uFromWhere )
 	HANDLE	hFile
 	LONG	ivOffset
 	LONG *	ioivOffsetHigh
 	DWORD	uFromWhere
+    PREINIT:
+    LONG nrtn;
     CODE:
-	RETVAL= SetFilePointer( hFile, ivOffset, ioivOffsetHigh, uFromWhere );
-	if(  RETVAL == INVALID_SET_FILE_POINTER && (GetLastError() != NO_ERROR)  ) {
+	nrtn= SetFilePointer( hFile, ivOffset, ioivOffsetHigh, uFromWhere );
+	if(  nrtn == INVALID_SET_FILE_POINTER && (GetLastError() != NO_ERROR)  ) {
 	    SaveErr( 1 );
-	    XST_mNO(0);
-	} else if(  0 == RETVAL  ) {
-	    XST_mPV(0,"0 but true");
+        RETVAL = &PL_sv_no;
 	} else {
-	    XST_mIV(0,RETVAL);
-	}
+        if(  0 == nrtn  ) {
+            RETVAL = newSVpvs("0 but true" );
+        } else {
+            RETVAL = newSViv(PTR2IV(nrtn));
+        }
+    }
     OUTPUT:
+    RETVAL
 	ioivOffsetHigh
 
 
@@ -634,17 +882,18 @@ WriteFile( hFile, pBuffer, lBytes, ouBytesWritten, pOverlapped )
     CODE:
 	/* SvCUR(ST(1)) might "panic" if pBuffer isn't valid */
 	if(  0 == lBytes  ) {
-	    lBytes= SvCUR(ST(1));
-	} else if(  SvCUR(ST(1)) < lBytes  ) {
+	    lBytes= SvCUR(svpBuffer);
+	} else if(  SvCUR(svpBuffer) < lBytes  ) {
 	    croak( "%s: pBuffer value too short (%d < %d)",
-	      "Win32API::File::WriteFile", SvCUR(ST(1)), lBytes );
+	      "Win32API::File::WriteFile", SvCUR(svpBuffer), lBytes );
 	}
 	RETVAL= WriteFile( hFile, pBuffer, lBytes,
 		  &ouBytesWritten, pOverlapped );
 	SaveErr( !RETVAL );
     OUTPUT:
 	RETVAL
-	ouBytesWritten
+    SETMAGIC: DISABLE
+	ouBytesWritten ODWORDOUTMG(ouBytesWritten)
 
 void
 GetStdHandle(fd)

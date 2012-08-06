@@ -226,6 +226,12 @@
 
 /* Simplify using SvGROW() for byte-sized buffers: */
 #define lSvGROW(sv,n)	SvGROW( sv, 0==(n) ? MIN_GROW_SIZE : (n)+1 )
+/*
+not complete, not used, might require a ROK check for sv_grow to unref
+ #define lsafeSvGROW(sv,n) \
+((SvTYPE(sv) < SVt_PV \
+|| SvLEN(sv) < 0==(n) ? MIN_GROW_SIZE : (n)+1)\
+? sv_grow(sv,n) : SvPVX(sv))*/
 
 /* Simplify using SvGROW() for WCHAR-sized buffers: */
 #define lwSvGROW(sv,n)	CAST( WCHAR *,		\
@@ -233,12 +239,11 @@
 
 /* Whether the buffer size we got lets us change what buffer size we use: */
 #define autosize(sv)	(!(  SvOK(sv)  &&  ! SvROK(sv)		\
-			 &&  SvPV_nolen(sv)  &&  '=' == *SvPV_nolen(sv)  ))
+			 &&  '=' == *SvPV_nolen(sv)  ))
 
 /* Get the IV/UV for a parameter that might be C<[]> or C<undef>: */
-#define optIV(sv)	( null_arg(sv) ? 0 : !SvOK(sv) ? 0 : SvIV(sv) )
-#define optUV(sv)	( null_arg(sv) ? 0 : !SvOK(sv) ? 0 : SvUV(sv) )
-
+#define optIV(sv) (optNumIn(aTHX_ sv, 0).iv)
+#define optUV(sv) (optNumIn(aTHX_ sv, 1).uv)
 /* Allocate temporary storage that will automatically be freed later: */
 #ifndef TempAlloc	/* Can be C<#define>d to be C<_alloca>, for example */
 # define TempAlloc( size )	sv_grow( sv_newmortal(), size )
@@ -257,9 +262,7 @@
 /* In INPUT section put ": init_buf_pl($var,$arg,$type);" after var name. */
 
 /* Initialize a buffer size argument of type DWORD: */
-#define init_buf_l( svSize )						\
-	(  null_arg(svSize) ? 0 : autosize(svSize) ? optUV(svSize)	\
-	   : strtoul( 1+SvPV_nolen(svSize), NULL, 10 )  )
+#define init_buf_l( svSize ) fn_init_buf_l(aTHX_ svSize )
 /* In INPUT section put "= init_buf_l($arg);" after variable name. */
 
 /* Lengths in WCHARs are initialized the same as lengths in bytes: */
@@ -308,7 +311,8 @@
 	} } STMT_END
 
 /* Grow a buffer where we have its size in bytes: */
-#define	grow_buf_l( sBuf,svBuf,tpBuf, lSize,svSize )	STMT_START {	\
+#define	grow_buf_l( sBuf,svBuf,tpBuf,lSize,svSize ) sBuf = (tpBuf)fn_grow_buf_l(aTHX_ svBuf,&(lSize),svSize, 0 )
+/*#define	grow_buf_l( sBuf,svBuf,tpBuf, lSize,svSize )	STMT_START {	\
 	if(  null_arg(svBuf)  ) {					\
 	    sBuf= NULL;							\
 	} else {							\
@@ -318,9 +322,10 @@
 	    sBuf= CAST( tpBuf, lSvGROW( svBuf, lSize ) );		\
 	    if(  autosize(svSize)  )   lSize= SvLEN(svBuf) - 1;		\
 	} } STMT_END
-
+*/
 /* Grow a buffer where we have its size in WCHARs: */
-#define	grow_buf_lw( swBuf,svBuf, lwSize,svSize )	STMT_START {	\
+#define	grow_buf_lw( sBuf,svBuf, lSize,svSize ) sBuf = (WCHAR *)fn_grow_buf_l(aTHX_ svBuf,&(lSize),svSize, 1 )
+/*#define	grow_buf_lw( swBuf,svBuf, lwSize,svSize )	STMT_START {	\
 	if(  null_arg(svBuf)  ) {					\
 	    swBuf= NULL;						\
 	} else {							\
@@ -331,6 +336,7 @@
 	    if(  autosize(svSize)  )					\
 		lwSize= SvLEN(svBuf)/sizeof(WCHAR) - 1;			\
 	} } STMT_END
+*/
 
 /* Grow a buffer that contains the declared fixed data type: */
 #define	grow_buf( pBuf,svBuf, tpBuf )			STMT_START {	\
@@ -421,3 +427,55 @@
 	    SvPOK_only( svBuf );					\
 	    SvCUR_set( svBuf, wcslen(sBuf)*sizeof(WCHAR) );		\
 	} } STMT_END
+
+/*CBOOL = char bool , some typemap helpers that take a bool use this.
+MS's BOOL is a 4 byte integer, this reduced a bool value to 1 byte, with a
+compiler warning if a constant that overflowed is passed.
+CBOOL is inteded to be truthhood checked, not bitfield checked
+if a typemap helper takes flags or bitfields, use UCHAR, not CBOOL*/
+typedef unsigned char CBOOL;
+
+/*for numeric typemap helpers, this union keeps the distinction between signed
+and unsigned, the compiler will optimize merge un/signed branches together in
+most places, a flag argument to a typemap helper always tells the typemap helper
+what this union contains. This struct union is intended to be <= machine word
+size.*/
+typedef struct {
+union{
+    UV uv;
+    IV iv;
+};
+} U_IVUV;
+/*this is used for output typemap helpers, in some Win32 File functions, DWORD *
+ are required, these may be null on user's choice, although due to null_arg macro
+ check in the output typemap helper a null member p will never be dereferenced.
+ This union allows the dereferencing opcode to be moved from the typemap type
+ in the callee function to the typemap helper function. There is no machine code
+ penalty in the callee since the flags are always an immediate 1 byte constant
+ pushed onto the C stack. A flag argument always tells the typemap helper what
+ this union contains. This struct union is intended to be <= machine word size.
+ */
+typedef struct {
+union{
+    union{
+        U32 * u32;
+        I32 * i32;
+        UINT64 * u64; /*Perl _64 types not defined on 32 bits/no quads*/
+        INT64 * i64;
+        LPVOID v;
+    } p;
+    U_IVUV num;
+};
+} UPU_IVUV;
+
+/*get NUMOUT size flag for a pointer to number, takes a pointer to a number*/
+#define NUMOUT_SZ_FLAG(var) (sizeof(*var) == 8 ? NUMOUT_8BYTES : sizeof(*var) == 4 ? NUMOUT_4BYTES : (DebugBreak(), 0))
+
+/* when doing SvSETMAGIC surpression with SETMAGIC: DISABLE in an OUTPUT: section
+  this macro can be placed in the OUTPUT: section overriding the typemap,
+  and saving a SvSETMAGIC branch. Do not put this macro in any typemap, since
+  typemaps are SETMAGIC: ENABLE as a standard in ::File, since the flags are
+  always an immediate 1 byte constant, there is no overhead from the extra flags*/
+#define ODWORDOUTMG(name) {UPU_IVUV uvar; uvar.num.uv = PTR2UV( name ); \
+NumOut(aTHX_ sv##name, uvar, NUMOUT_UV|NUMOUT_OUT|NUMOUT_LIT|NUMOUT_MAGIC);}
+
